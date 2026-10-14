@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>City Search</title>
+<script src="tableau.extensions.1.latest.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    margin: 0;
+    padding: 16px;
+    background: #f7f8fa;
+    color: #222;
+  }
+  h3 { margin: 0 0 12px 0; font-size: 15px; font-weight: 600; }
+  .search-wrap { position: relative; }
+  input[type="text"] {
+    width: 100%;
+    padding: 9px 10px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 14px;
+  }
+  input[type="text"]:disabled { background: #eee; color: #999; }
+  input[type="text"]:focus { outline: none; border-color: #4a90d9; }
+
+  #results {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    background: white;
+    border: 1px solid #ddd;
+    border-top: none;
+    border-radius: 0 0 6px 6px;
+    max-height: 260px;
+    overflow-y: auto;
+    z-index: 10;
+    display: none;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.08);
+  }
+  #results.show { display: block; }
+
+  .result-item {
+    padding: 9px 10px;
+    cursor: pointer;
+    border-bottom: 1px solid #f0f0f0;
+    font-size: 13px;
+  }
+  .result-item:last-child { border-bottom: none; }
+  .result-item:hover, .result-item.active { background: #eef3fb; }
+  .result-name { font-weight: 600; }
+  .result-detail { color: #777; font-size: 11px; margin-top: 1px; }
+
+  #status {
+    margin-top: 10px;
+    font-size: 12px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    display: none;
+    word-break: break-word;
+  }
+  #status.ok { display: block; background: #e6f4ea; color: #1d6f42; }
+  #status.err { display: block; background: #fdecea; color: #b3261e; }
+  #status.pending { display: block; background: #eef3fb; color: #3a5f8a; }
+
+  #setup-notice {
+    font-size: 11px;
+    color: #888;
+    margin-top: 14px;
+    line-height: 1.4;
+  }
+  #config-link { color: #4a90d9; cursor: pointer; text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h3>Search for a City</h3>
+
+<div class="search-wrap">
+  <input type="text" id="cityInput" placeholder="Loading city list..." autocomplete="off" disabled>
+  <div id="results"></div>
+</div>
+
+<div id="status"></div>
+
+<div id="setup-notice">
+  Not configured yet? <span id="config-link">Set parameter names</span>
+</div>
+
+<script>
+window.addEventListener('error', function(e) {
+  const statusEl = document.getElementById('status');
+  if (statusEl) {
+    statusEl.textContent = 'DEBUG GLOBAL ERROR: ' + e.message + ' (line ' + e.lineno + ')';
+    statusEl.className = 'err';
+    statusEl.style.display = 'block';
+  }
+});
+
+(function() {
+  let settings = {};
+  let latParam = null;
+  let lngParam = null;
+  let debounceTimer = null;
+  let currentResults = [];
+  let activeIndex = -1;
+  let allCities = [];
+  let citiesLoaded = false;
+
+  const input = document.getElementById('cityInput');
+  const resultsEl = document.getElementById('results');
+  const statusEl = document.getElementById('status');
+
+  function setStatus(msg, kind) {
+    statusEl.textContent = msg;
+    statusEl.className = kind || '';
+    statusEl.style.display = msg ? 'block' : 'none';
+  }
+
+  function requiredSettingsPresent() {
+    return settings.latParamName && settings.lngParamName;
+  }
+
+  function runConfig() {
+    const latName = window.prompt('Exact name of your Latitude parameter in Tableau:', settings.latParamName || 'Latitude');
+    if (latName === null) return;
+    const lngName = window.prompt('Exact name of your Longitude parameter in Tableau:', settings.lngParamName || 'Longitude');
+    if (lngName === null) return;
+
+    settings = {
+      latParamName: latName.trim(),
+      lngParamName: lngName.trim()
+    };
+
+    tableau.extensions.settings.set('latParamName', settings.latParamName);
+    tableau.extensions.settings.set('lngParamName', settings.lngParamName);
+
+    tableau.extensions.settings.saveAsync().then(() => {
+      setStatus('Settings saved.', 'ok');
+      resolveParameters();
+    }).catch(err => setStatus('Failed to save settings: ' + err.message, 'err'));
+  }
+
+  function loadSettings() {
+    const s = tableau.extensions.settings.getAll();
+    settings = {
+      latParamName: s.latParamName || '',
+      lngParamName: s.lngParamName || ''
+    };
+  }
+
+  function resolveParameters() {
+    if (!requiredSettingsPresent()) return;
+    tableau.extensions.dashboardContent.dashboard.getParametersAsync().then(params => {
+      latParam = params.find(p => p.name === settings.latParamName) || null;
+      lngParam = params.find(p => p.name === settings.lngParamName) || null;
+      if (!latParam || !lngParam) {
+        setStatus('Could not find parameters named "' + settings.latParamName +
+          '" and "' + settings.lngParamName + '". Check spelling via Configure.', 'err');
+      }
+    });
+  }
+
+  // Load the static city list once, from the same folder as this HTML file.
+  async function loadCities() {
+    setStatus('DEBUG: starting fetch of cities.json, location=' + window.location.href, 'pending');
+    try {
+      const resp = await fetch('cities.json');
+      setStatus('DEBUG: fetch returned, status=' + resp.status + ' ok=' + resp.ok, 'pending');
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const text = await resp.text();
+      setStatus('DEBUG: got text, length=' + text.length + ' chars. Parsing JSON...', 'pending');
+      allCities = JSON.parse(text);
+      setStatus('DEBUG: parsed OK, ' + allCities.length + ' cities loaded.', 'ok');
+      citiesLoaded = true;
+      input.disabled = false;
+      input.placeholder = 'Type a city name, e.g. Idaho Falls';
+      setTimeout(() => setStatus('', ''), 4000);
+    } catch (err) {
+      setStatus('DEBUG ERROR in loadCities: ' + err.name + ': ' + err.message, 'err');
+    }
+  }
+
+  function formatDetail(place) {
+    return place.state || '';
+  }
+
+  function searchCities(query) {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+
+    const startsWith = [];
+    const contains = [];
+
+    for (let i = 0; i < allCities.length; i++) {
+      const c = allCities[i];
+      const nameLower = c.name.toLowerCase();
+      if (nameLower.startsWith(q)) {
+        startsWith.push(c);
+      } else if (nameLower.includes(q)) {
+        contains.push(c);
+      }
+      if (startsWith.length >= 8 && contains.length >= 8) break;
+    }
+
+    return startsWith.concat(contains).slice(0, 8);
+  }
+
+  function renderResults(places) {
+    currentResults = places;
+    activeIndex = -1;
+    if (places.length === 0) {
+      resultsEl.innerHTML = '<div class="result-item" style="color:#999; cursor:default;">No matches found</div>';
+      resultsEl.classList.add('show');
+      return;
+    }
+    resultsEl.innerHTML = places.map((p, i) =>
+      '<div class="result-item" data-index="' + i + '">' +
+        '<div class="result-name">' + escapeHtml(p.name) + '</div>' +
+        '<div class="result-detail">' + escapeHtml(formatDetail(p)) + '</div>' +
+      '</div>'
+    ).join('');
+    resultsEl.classList.add('show');
+
+    Array.from(resultsEl.querySelectorAll('.result-item[data-index]')).forEach(el => {
+      el.addEventListener('click', () => {
+        const idx = parseInt(el.getAttribute('data-index'), 10);
+        selectPlace(currentResults[idx]);
+      });
+    });
+  }
+
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str || '';
+    return div.innerHTML;
+  }
+
+  async function selectPlace(place) {
+    if (!requiredSettingsPresent()) {
+      setStatus('Please configure the extension first (link below).', 'err');
+      return;
+    }
+    if (!latParam || !lngParam) {
+      setStatus('Parameters not resolved. Try Configure again.', 'err');
+      return;
+    }
+    resultsEl.classList.remove('show');
+    input.value = place.name + (place.state ? ', ' + place.state : '');
+    setStatus('Plotting...', 'pending');
+    try {
+      await latParam.changeValueAsync(place.lat);
+      await lngParam.changeValueAsync(place.lng);
+      setStatus('Plotted: ' + place.name + (place.state ? ', ' + place.state : ''), 'ok');
+    } catch (err) {
+      setStatus('Failed to update parameters: ' + err.message, 'err');
+    }
+  }
+
+  input.addEventListener('input', () => {
+    if (!citiesLoaded) return;
+    const q = input.value.trim();
+    clearTimeout(debounceTimer);
+    if (q.length < 2) {
+      resultsEl.classList.remove('show');
+      return;
+    }
+    debounceTimer = setTimeout(() => {
+      const places = searchCities(q);
+      renderResults(places);
+    }, 100);
+  });
+
+  input.addEventListener('keydown', (e) => {
+    const items = resultsEl.querySelectorAll('.result-item[data-index]');
+    if (!resultsEl.classList.contains('show') || items.length === 0) return;
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      activeIndex = Math.min(activeIndex + 1, items.length - 1);
+      updateActive(items);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      activeIndex = Math.max(activeIndex - 1, 0);
+      updateActive(items);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (activeIndex >= 0 && currentResults[activeIndex]) {
+        selectPlace(currentResults[activeIndex]);
+      }
+    } else if (e.key === 'Escape') {
+      resultsEl.classList.remove('show');
+    }
+  });
+
+  function updateActive(items) {
+    items.forEach(el => el.classList.remove('active'));
+    if (activeIndex >= 0 && items[activeIndex]) {
+      items[activeIndex].classList.add('active');
+      items[activeIndex].scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.search-wrap')) {
+      resultsEl.classList.remove('show');
+    }
+  });
+
+  document.getElementById('config-link').addEventListener('click', runConfig);
+
+  setStatus('DEBUG: script running, calling initializeAsync...', 'pending');
+
+  tableau.extensions.initializeAsync({ configure: runConfig }).then(() => {
+    setStatus('DEBUG: initializeAsync succeeded. Loading settings...', 'pending');
+    loadSettings();
+    if (!requiredSettingsPresent()) {
+      setStatus('DEBUG: init OK, not configured yet.', 'err');
+    } else {
+      resolveParameters();
+    }
+    loadCities();
+  }).catch(err => {
+    setStatus('DEBUG ERROR in initializeAsync: ' + err.name + ': ' + err.message, 'err');
+  });
+})();
+</script>
+
+</body>
+</html>
